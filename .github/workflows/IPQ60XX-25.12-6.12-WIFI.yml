@@ -1,304 +1,178 @@
-# ZN-M2 OpenWrt编译工作流
-# 工作流版本: v1.8 (2025-12-26)
-# 主要改进: 完全移除LED相关配置，专注核心功能
-# 修复记录:
-# v1.8 - 无LED版本，彻底移除所有LED相关配置
-# v1.7 - 25.12专用修复版，不改变OpenWrt版本
-# v1.6 - Athena LED软件包错误修复版
-# v1.5 - 补丁错误修复版
-# v1.4 - 磁盘空间优化版
-# v1.3 - 修复交叉工具链缺失
-# v1.2 - 修复IPv6模块缺失
-# v1.1 - 修复目标平台错误
-# v1.0 - 初始版本
-
-name: ZN-M2_Build_v1.8_NoLED
+name: IPQ60XX-6.12-WIFI
 
 on:
   workflow_dispatch:
-    inputs:
-      build_threads:
-        description: 下载线程数（推荐2）
-        required: false
-        default: '2'
+  schedule:
+    - cron: 0 19 * * *
+
+env:
+  REPO_URL: https://github.com/LiBwrt/openwrt-6.x.git
+  REPO_BRANCH: main-nss
+  CONFIG_FILE: configs/ipq60xx-6.12-wifi.config
+  DIY_SCRIPT: diy-mini.sh
+  CLASH_KERNEL: amd64
+  CACHE_TOOLCHAIN: true
+  UPLOAD_BIN_DIR: false
+  FIRMWARE_RELEASE: true
+  FIRMWARE_TAG: IPQ60XX-6.12-WIFI
+  TZ: Asia/Shanghai
 
 jobs:
-  build_znm2:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 480
-    env:
-      TZ: Asia/Shanghai
-      OPENWRT_DIR: ${{ github.workspace }}/openwrt
-      WORKFLOW_VERSION: "v1.8"
-      OPENWRT_VERSION: "25.12"  # 严格保留25.12版本！
-      TMP_BUILD_DIR: /tmp/openwrt-build
+  Build:
+    runs-on: ubuntu-latest
 
     steps:
-      # 步骤0: 紧急清理磁盘空间 [v1.4]
-      - name: 紧急清理磁盘空间 [v1.4]
-        run: |
-          echo "=== 开始清理磁盘空间 ==="
-          df -h
-          
-          sudo apt clean
-          sudo apt autoremove -y --purge
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          sudo npm cache clean --force || true
-          sudo pip3 cache purge || true
-          sudo rm -rf /home/runner/.cache || true
-          
-          echo "=== 清理后磁盘空间 ==="
-          df -h
+    - name: Check Server Performance(检查服务器性能)
+      run: |
+        echo "警告⚠"
+        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
+        echo -e "已知CPU型号（降序）：7763，8370C，8272CL，8171M，E5-2673 \n"
+        echo "--------------------------CPU信息--------------------------"
+        echo "CPU物理数量：$(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
+        echo -e "CPU核心信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
+        echo "--------------------------内存信息--------------------------"
+        echo "已安装内存详细信息："
+        echo -e "$(sudo lshw -short -C memory | grep GiB) \n"
+        echo "--------------------------硬盘信息--------------------------"
+        echo "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
 
-      # 步骤1: 环境初始化 [v1.4优化]
-      - name: 初始化环境 (工作流v${{ env.WORKFLOW_VERSION }})
-        run: |
-          echo "=== ZN-M2编译工作流 v${{ env.WORKFLOW_VERSION }} ==="
-          echo "严格使用OpenWrt ${{ env.OPENWRT_VERSION }}版本！"
-          echo "完全移除LED相关配置，专注核心功能"
-          
-          # 创建tmpfs挂载点
-          sudo mkdir -p ${{ env.TMP_BUILD_DIR }}
-          sudo mount -t tmpfs -o size=15G,uid=runner,gid=runner tmpfs ${{ env.TMP_BUILD_DIR }}
-          
-          # 将OpenWrt目录链接到tmpfs
-          rm -rf $OPENWRT_DIR
-          ln -s ${{ env.TMP_BUILD_DIR }}/openwrt $OPENWRT_DIR
-          mkdir -p ${{ env.TMP_BUILD_DIR }}/openwrt
-          
-          echo "环境初始化完成"
-          df -h | grep tmpfs
+    - name: Initialization Environment(初始化环境)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+        sudo -E apt -yqq install dos2unix
+        sudo -E apt -yqq install libfuse-dev
+        sudo -E apt -yqq autoremove --purge
+        sudo -E apt -yqq autoclean
+        sudo -E apt -yqq clean
+        sudo -E systemctl daemon-reload
+        sudo timedatectl set-timezone "$TZ"
 
-      # 步骤2: 拉取OpenWrt 25.12源码 [严格保留]
-      - name: 拉取OpenWrt ${{ env.OPENWRT_VERSION }} [严格保留]
-        run: |
-          echo "使用OpenWrt ${{ env.OPENWRT_VERSION }}版本！"
-          git clone --depth 1 -b openwrt-${{ env.OPENWRT_VERSION }} https://github.com/openwrt/openwrt $OPENWRT_DIR
-          cd $OPENWRT_DIR
-          echo "OpenWrt源码拉取完成 (大小: $(du -sh $OPENWRT_DIR | cut -f1))"
+    - name: Combine Disks(合并磁盘)
+      uses: easimon/maximize-build-space@master
+      with:
+        swap-size-mb: 1024
+        temp-reserve-mb: 100
+        root-reserve-mb: 1024
 
-      # 步骤3: 安装最小化依赖 [v1.4优化]
-      - name: 安装最小化编译依赖 [v1.4优化]
-        run: |
-          sudo apt update -y && sudo apt install -y \
-            build-essential clang flex bison g++ gawk \
-            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-            python3-distutils rsync unzip zlib1g-dev \
-            file wget curl xz-utils libelf-dev libncursesw5-dev \
-            pkg-config patchutils bc cpio squashfs-tools liblz4-tool \
-            zip unzip zstd device-tree-compiler swig ccache m4
-          
-          echo "依赖安装完成"
-          df -h | grep /dev/root
+    - name: Checkout
+      uses: actions/checkout@main
 
-      # 步骤4: 配置目标平台 [v1.1修复]
-      - name: 配置ZN-M2平台 [v1.1修复平台错误]
-        run: |
-          cd $OPENWRT_DIR
-          
-          # 强制设置为qualcommax/ipq60xx [v1.1关键修复]
-          echo "CONFIG_TARGET_BOARD='qualcommax'" > .config
-          echo "CONFIG_TARGET_SUBTARGET='ipq60xx'" >> .config
-          echo "CONFIG_TARGET_PROFILE='DEVICE_zn_m2'" >> .config
-          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2=y" >> .config
-          
-          # 基础配置
-          echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
-          echo "CONFIG_TARGET_ROOTFS_SIZE=8192" >> .config
-          echo "CONFIG_NO_MKLIBS=y" >> .config
-          echo "CONFIG_BUILD_LOG=n" >> .config  # 禁用详细构建日志 [v1.4新增]
-          
-          # 网络功能
-          echo "CONFIG_PACKAGE_wpad-wolfssl=y" >> .config
-          echo "CONFIG_PACKAGE_dnsmasq=y" >> .config
-          
-          # IPv6支持 [v1.2修复]
-          echo "CONFIG_PACKAGE_odhcp6c=y" >> .config
-          echo "CONFIG_PACKAGE_odhcpd-ipv6only=y" >> .config
-          echo "CONFIG_PACKAGE_ip6tables=y" >> .config
-          echo "CONFIG_PACKAGE_iptables=y" >> .config
-          
-          # NSS加速
-          echo "CONFIG_PACKAGE_kmod-qca-nss-drv=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-qca-nss-ecm=y" >> .config
-          echo "CONFIG_PACKAGE_nss-firmware-ipq6010=y" >> .config
-          
-          # 使用APK包管理器（25.12新特性）
-          echo "CONFIG_PACKAGE_apk=y" >> .config
-          echo "CONFIG_PACKAGE_apk-utils=y" >> .config
-          echo "CONFIG_PACKAGE_libapk=y" >> .config
-          echo "CONFIG_PACKAGE_opkg=n" >> .config
-          echo "CONFIG_PACKAGE_luci-app-opkg=n" >> .config
+    - name: Clone Source Code(克隆源代码)
+      run: |
+        df -hT $GITHUB_WORKSPACE
+        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+        cd openwrt
+        echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+        VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
+        echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
 
-          echo "平台配置完成"
+    - name: Generate Variables(生成变量)
+      run: |
+        cp $CONFIG_FILE $OPENWRT_PATH/.config
+        cd $OPENWRT_PATH
+        make defconfig > /dev/null 2>&1
+        SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
+        echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
+        DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
+        echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
+        DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
+        echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
 
-      # 步骤5: 配置Feed源 [适配25.12]
-      - name: 配置Feed源 [适配25.12]
-        run: |
-          cd $OPENWRT_DIR
-          rm -rf feeds.conf.default
-          cat > feeds.conf.default << EOF
-          src-git packages https://github.com/openwrt/packages.git;openwrt-${{ env.OPENWRT_VERSION }}
-          src-git luci https://github.com/openwrt/luci.git;openwrt-${{ env.OPENWRT_VERSION }}
-          src-git nss https://github.com/robimarko/nss-packages.git
-          EOF
-          
-          ./scripts/feeds update -a --quiet
-          ./scripts/feeds install -a --quiet
-          
-          echo "Feed配置完成"
-          df -h | grep tmpfs
+    - name: Cache Toolchain(缓存工具链)
+      if: env.CACHE_TOOLCHAIN == 'true'
+      uses: HiGarfield/cachewrtbuild@main
+      with:
+        ccache: false
+        mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
+        prefix: ${{ env.OPENWRT_PATH }}
+    
+    - name: Install Feeds(安装feeds)
+      run: |
+        cd $OPENWRT_PATH
+        ./scripts/feeds update -a
+        git clone --depth 1 https://github.com/sbwml/openwrt_pkgs.git package/new/custom
+        mv package/new/custom/luci-app-netspeedtest  package/new
+        mv package/new/custom/speedtest-cli package/new
+        rm -rf package/new/custom
+        ./scripts/feeds install -a
+  
+    - name: Load Custom Configuration(加载自定义配置)
+      run: |
+        [ -e files ] && mv files $OPENWRT_PATH/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
+        chmod +x $DIY_SCRIPT
+        cd $OPENWRT_PATH
+        $GITHUB_WORKSPACE/$DIY_SCRIPT
 
-      # 步骤6: 彻底移除所有LED相关配置 [v1.8核心改进]
-      - name: 彻底移除所有LED相关配置 [v1.8核心改进]
-        run: |
-          cd $OPENWRT_DIR
-          
-          echo "=== 开始彻底移除所有LED相关配置 ==="
-          echo "根据您的要求：可以不用LED功能"
-          
-          # 1. 清理.config中的LED相关配置
-          echo "1. 清理.config中的LED相关配置..."
-          if grep -q -E "(LED|led|athena)" .config; then
-            echo "发现LED相关配置，正在移除..."
-            sed -i '/LED/d; /led/d; /athena/d' .config
-          fi
-          
-          # 2. 明确禁用所有LED相关软件包
-          echo "2. 明确禁用所有LED相关软件包..."
-          echo "CONFIG_PACKAGE_kmod-leds-gpio=n" >> .config
-          echo "CONFIG_PACKAGE_kmod-ledtrig-default-on=n" >> .config
-          echo "CONFIG_PACKAGE_kmod-ledtrig-heartbeat=n" >> .config
-          echo "CONFIG_PACKAGE_kmod-ledtrig-netdev=n" >> .config
-          echo "CONFIG_PACKAGE_kmod-ledtrig-timer=n" >> .config
-          echo "CONFIG_PACKAGE_luci-app-athena-led=n" >> .config
-          echo "CONFIG_PACKAGE_luci-i18n-athena-led-zh-cn=n" >> .config
-          echo "CONFIG_PACKAGE_luci-app-led=n" >> .config
-          echo "CONFIG_PACKAGE_luci-i18n-led-zh-cn=n" >> .config
-          
-          # 3. 清理target Makefile中的LED引用
-          echo "3. 清理target Makefile中的LED引用..."
-          if [ -f "target/linux/qualcommax/image/Makefile" ]; then
-            echo "检查target/linux/qualcommax/image/Makefile..."
-            # 备份原始文件
-            cp target/linux/qualcommax/image/Makefile target/linux/qualcommax/image/Makefile.bak
-            
-            # 移除包含LED或athena的行
-            if grep -q -E "(LED|led|athena)" target/linux/qualcommax/image/Makefile; then
-              echo "发现LED相关引用，正在移除..."
-              sed -i '/LED/d; /led/d; /athena/d' target/linux/qualcommax/image/Makefile
-              echo "已移除LED相关引用"
-            fi
-          fi
-          
-          # 4. 清理设备配置中的LED引用
-          echo "4. 清理设备配置中的LED引用..."
-          DEVICE_CONFIG=$(find target/linux/qualcommax/ -name "*zn_m2*.dts" -o -name "*zn_m2*.dtsi" 2>/dev/null | head -1)
-          if [ -n "$DEVICE_CONFIG" ] && [ -f "$DEVICE_CONFIG" ]; then
-            echo "检查设备配置文件: $DEVICE_CONFIG"
-            # 备份原始文件
-            cp "$DEVICE_CONFIG" "${DEVICE_CONFIG}.bak"
-            
-            # 移除LED相关节点
-            if grep -q -A 10 -B 2 "leds" "$DEVICE_CONFIG"; then
-              echo "发现LED节点，正在处理..."
-              # 这是一个更安全的方式，只注释LED节点而不是删除
-              sed -i '/leds {/,/}/s/^/\/\//' "$DEVICE_CONFIG"
-              echo "已注释LED节点"
-            fi
-          fi
-          
-          # 5. 验证清理结果
-          echo "5. 验证清理结果..."
-          echo "当前.config中LED相关配置:"
-          grep -E "(LED|led|athena)" .config || echo "无LED相关配置"
-          
-          echo "=== 所有LED相关配置已彻底移除 ==="
-          echo "编译将专注于核心网络功能，不包含LED控制"
+    - name: Download DL Package(下载DL软件包)
+      run: |
+        cd $OPENWRT_PATH
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-      # 步骤7: 编译工具链 [v1.3新增]
-      - name: 编译交叉工具链 [v1.3修复工具链缺失]
-        run: |
-          cd $OPENWRT_DIR
-          make toolchain/compile V=m
-          echo "交叉工具链编译完成"
-          df -h | grep tmpfs
+    - name: Compile Firmware(开始编译固件)
+      id: compile
+      run: |
+        cd $OPENWRT_PATH
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
 
-      # 步骤8: 编译内核 [v1.3新增]
-      - name: 编译内核
-        run: |
-          cd $OPENWRT_DIR
-          make target/linux/compile V=m
-          echo "内核编译完成"
-          df -h | grep tmpfs
+    - name: Check Space Usage(检查空间使用情况)
+      if: (!cancelled())
+      run: df -hT
 
-      # 步骤9: 编译完整固件 [v1.8优化]
-      - name: 编译完整固件 [v1.8无LED版本]
-        run: |
-          cd $OPENWRT_DIR
-          
-          echo "=== 开始编译OpenWrt ${{ env.OPENWRT_VERSION }}固件 ==="
-          echo "版本: 无LED功能，专注核心网络性能"
-          
-          # 编译固件，使用V=m减少日志
-          make -j1 V=m || {
-            echo "=== 编译失败，显示详细错误信息 ==="
-            # 显示最后200行错误日志
-            tail -200 $OPENWRT_DIR/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx/build.log || true
-            # 显示.config文件内容
-            echo "=== 当前.config文件内容 ==="
-            cat .config | grep -E "(athena|PACKAGE_|TARGET_)" | head -50
-            exit 1
-          }
-          
-          echo "固件编译完成"
-          df -h | grep tmpfs
+    - name: Upload Bin Directory(上传固件)
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      uses: actions/upload-artifact@main
+      with:
+        name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+        path: ${{ env.OPENWRT_PATH }}/bin
 
-      # 步骤10: 验证并打包 [v1.3优化]
-      - name: 验证固件 [v1.3优化命名]
-        run: |
-          cd $OPENWRT_DIR
-          
-          # 查找固件文件
-          FIRMWARE=$(find bin/targets/qualcommax/ipq60xx/ -name "openwrt-qualcommax-ipq60xx-zn_m2-*.bin" 2>/dev/null | head -1)
-          
-          if [ ! -f "$FIRMWARE" ]; then
-            echo "错误：固件文件不存在"
-            echo "目录内容："
-            ls -la bin/targets/qualcommax/ipq60xx/ || true
-            exit 1
-          fi
-          
-          # 生成带版本号的文件名
-          TIMESTAMP=$(date +%Y%m%d-%H%M)
-          NEW_NAME="ZN-M2_OpenWrt${{ env.OPENWRT_VERSION }}_NSS_NoLED_Workflow${{ env.WORKFLOW_VERSION }}_${TIMESTAMP}.bin"
-          
-          # 复制固件到工作目录
-          cp "$FIRMWARE" "$GITHUB_WORKSPACE/$NEW_NAME"
-          
-          echo "=== 编译完成 ==="
-          echo "固件版本: OpenWrt ${{ env.OPENWRT_VERSION }} (坚持使用您要求的版本！)"
-          echo "工作流版本: ${{ env.WORKFLOW_VERSION }}"
-          echo "固件特性: 无LED功能，专注核心网络性能"
-          echo "固件文件: $NEW_NAME"
-          echo "文件大小: $(stat -c%s "$GITHUB_WORKSPACE/$NEW_NAME") bytes"
-          echo "包含功能: NSS加速、IPv6、WiFi 6、APK包管理器"
+    - name: Organize Files(整理文件)
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd $OPENWRT_PATH/bin/targets/*/*
+        cat sha256sums
+        echo "VERSION_KERNEL=$(find -type f -name "*.manifest" -exec grep -oP '^kernel - \K.*?(?=~|-\d+-)' {} \;)" >> $GITHUB_ENV
+        cp $OPENWRT_PATH/.config build.config
+        mv -f $OPENWRT_PATH/bin/packages/*/*/*.apk packages
+        tar -zcf Packages.tar.gz packages
+        rm -rf packages feeds.buildinfo version.buildinfo
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
 
-      # 步骤11: 上传产物 [v1.3优化]
-      - name: 上传固件 [v1.3优化]
-        uses: actions/upload-artifact@v4
-        with:
-          name: ZN-M2_Firmware_Workflow${{ env.WORKFLOW_VERSION }}_NoLED
-          path: |
-            ${{ github.workspace }}/*.bin
-            ${{ env.OPENWRT_DIR }}/.config
-          retention-days: 90
+    - name: Upload Firmware To Artifact(将固件上传到Artifact)
+      if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
+      uses: actions/upload-artifact@main
+      with:
+        name: ${{ env.SOURCE_REPO }}-firmware-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE_PATH }}
 
-      # 步骤12: 清理tmpfs [v1.4新增]
-      - name: 清理tmpfs空间 [v1.4新增]
-        if: always()
-        run: |
-          echo "=== 清理tmpfs ==="
-          df -h | grep tmpfs
-          sudo umount ${{ env.TMP_BUILD_DIR }} || true
-          echo "tmpfs已清理"
+    - name: Upload Firmware To Release(发布固件)
+      if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
+      uses: ncipollo/release-action@v1
+      with:
+        name: R${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
+        allowUpdates: true
+        tag: ${{ env.FIRMWARE_TAG }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: ${{ env.FIRMWARE_PATH }}/*
+        body: |
+          **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
+          ### 📒 固件信息(WIFI)
+          - 带WIFI带有线NSS的6.12内核固件
+          - 💻 这是 ${{ env.FIRMWARE_TAG }} 平台使用的 OpenWrt 固件
+          - ⚽ 固件源码: ${{ env.REPO_URL }}
+          - 💝 源码分支: ${{ env.REPO_BRANCH }}
+          - 🌐 默认地址: 192.168.1.1
+          - 🔑 默认密码: password
+          ### 🧊 固件版本
+          - 固件内核版本：${{ env.VERSION_KERNEL }}
+          - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
+          - ${{ env.VERSION_INFO }}
